@@ -1,4 +1,5 @@
 
+
 /* agent_400.c - RemoteOps Agent (server) | Reg No: IT24103400 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -17,10 +18,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
  
-/* ---- Personalised values (IT24103400) ---- */
+
 #define REG_NO        "IT24103400"
-#define AGENT_PORT    9410                /* 7000 + 2410 */
-#define SID           "0043"              /* 3400 reversed; STRING to keep leading zero */
+#define AGENT_PORT    9410                
+#define SID           "0043"              
 #define AUTH_TOKEN    "OPS-3400"
 #define LOG_FILE      "remoteops_IT24103400.log"
 #define STORAGE_ROOT  "./agentfiles"
@@ -29,8 +30,9 @@
 #define MAX_LINE      1024
 #define IN_BUF        4096
 #define XFER_BUF      8192
-#define MAX_FILE_SIZE (50ULL * 1024 * 1024)   /* uploads above 50 MB -> ERR 004 */
-#define MAX_DRAIN     (1ULL << 30)            /* above 1 GB we close instead of draining */
+#define MAX_FILE_SIZE (50ULL * 1024 * 1024)   
+#define MAX_DRAIN     (1ULL << 30)            
+#define MONITOR_INTERVAL_SEC 2                
  
 /* One of these per connected Controller; owned by that client's thread */
 typedef struct {
@@ -40,9 +42,18 @@ typedef struct {
     int    authed;
     char   inbuf[IN_BUF];   /* leftover bytes between recv() calls */
     size_t inlen;
+ 
+    /* UDP monitoring: at most one stream per session, sent by its own thread */
+    int             mon_active;     /* 1 while a monitor thread is running */
+    int             mon_stop;       /* set to 1 to ask the monitor thread to finish */
+    int             mon_sock;       /* UDP socket used by the monitor thread */
+    int             mon_port;       /* Controller's UDP port */
+    pthread_t       mon_thread;
+    pthread_mutex_t mon_lock;       /* protects mon_stop, used with mon_cond */
+    pthread_cond_t  mon_cond;       /* lets MONITOR STOP wake the thread at once */
 } session_t;
  
-/* ---------- Logging (thread-safe) ---------- */
+/* Logging (thread-safe)  */
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
  
 /* Writes a timestamped line to the log file and to the console */
@@ -70,7 +81,7 @@ static void log_event(session_t *s, const char *fmt, ...)
     pthread_mutex_unlock(&log_lock);
 }
  
-/* ---------- Sending helpers ---------- */
+/* Sending helpers */
 /* send() may write fewer bytes than asked, so loop until everything is sent */
 static int send_all(int fd, const char *buf, size_t len)
 {
@@ -100,7 +111,7 @@ static int send_resp(session_t *s, const char *fmt, ...)
     return send_all(s->fd, out, (size_t)n);
 }
  
-/* ---------- Line reader (framing) ----------
+/* Line reader (framing)
  * Returns: 1 = got a line, 0 = client closed, -1 = recv error, -2 = line too long.
  * Handles: partial lines across recv() calls, and several lines in one recv().
  * Bytes after the newline stay in s->inbuf (essential for PUT, where
@@ -135,11 +146,11 @@ static int read_line(session_t *s, char *line, size_t max)
     }
 }
  
-/* =====================  DAY 2: COMMAND HANDLERS  ===================== */
+/* DAY 2: COMMAND HANDLERS */
 /* Every handler returns 0 normally, or -1 if the connection is lost
  * (the client thread then ends the session). */
  
-/* ---------- SYSINFO ---------- */
+/* SYSINFO*/
 /* Fills out with "<cpu_load> <mem_used_mb> <uptime_sec>" read from /proc.
  * Kept separate so the UDP monitor (Day 3) can reuse it. */
 static void get_sysinfo(char *out, size_t n)
@@ -177,7 +188,7 @@ static int handle_sysinfo(session_t *s)
     return send_resp(s, "OK SYSINFO %s", info);
 }
  
-/* ---------- LISTPROC ---------- */
+/* LISTPROC */
 /* Snapshot from "ps", returned as one line: pid:name,pid:name,... */
 static int handle_listproc(session_t *s)
 {
@@ -204,7 +215,7 @@ static int handle_listproc(session_t *s)
     return send_resp(s, "OK PROCS %s", list);
 }
  
-/* ---------- EXEC (fixed whitelist) ---------- */
+/* EXEC (fixed whitelist) */
 /* The client's text is only ever compared against this table. It is never
  * passed to the shell, so nothing outside these five commands can run. */
 static const struct { const char *name; const char *cmd; } exec_table[] = {
@@ -242,7 +253,7 @@ static int handle_exec(session_t *s, const char *name)
     return send_resp(s, "OK EXEC_RESULT %s", out);
 }
  
-/* ---------- File transfer helpers ---------- */
+/* File transfer helpers */
 /* Allow only [A-Za-z0-9._-], max 100 chars, not starting with '.'.
  * This blocks path traversal such as "../x" or "/etc/passwd". */
 static int valid_filename(const char *name)
@@ -291,7 +302,7 @@ static int reject_put(session_t *s, unsigned long long size, const char *err)
     return send_resp(s, "%s", err);
 }
  
-/* ---------- PUT <filename> <filesize> + raw bytes ---------- */
+/* PUT <filename> <filesize> + raw bytes */
 static int handle_put(session_t *s, char *args)
 {
     char *sp = strrchr(args, ' ');
@@ -373,7 +384,7 @@ static int handle_put(session_t *s, char *args)
     return send_resp(s, "OK FILE_RECEIVED %s", name);
 }
  
-/* ---------- GET <filename> ---------- */
+/* GET <filename> */
 static int handle_get(session_t *s, char *args)
 {
     char *name = args;
@@ -419,13 +430,107 @@ static int handle_get(session_t *s, char *args)
     return 0;
 }
  
-/* ---------- Per-client thread ---------- */
+/* UDP monitoring: MONITOR START <udp_port> / MONITOR STOP */
+/* Runs in its own thread: send one SYSINFO datagram, sleep for the interval, repeat.
+ * The sleep is a timed wait on a condition variable, so a stop request wakes the
+ * thread immediately instead of waiting out the interval. */
+static void *monitor_thread(void *arg)
+{
+    session_t *s = arg;
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof dst);
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons((unsigned short)s->mon_port);
+    inet_pton(AF_INET, s->ip, &dst.sin_addr);      /* the Controller's own IP */
+ 
+    pthread_mutex_lock(&s->mon_lock);
+    while (!s->mon_stop) {
+        char info[128], msg[192];
+        get_sysinfo(info, sizeof info);
+        int n = snprintf(msg, sizeof msg, "SYSINFO %s SID:%s", info, SID);
+        sendto(s->mon_sock, msg, (size_t)n, 0, (struct sockaddr *)&dst, sizeof dst);
+ 
+        struct timespec deadline;
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += MONITOR_INTERVAL_SEC;
+        pthread_cond_timedwait(&s->mon_cond, &s->mon_lock, &deadline);
+    }
+    pthread_mutex_unlock(&s->mon_lock);
+    return NULL;
+}
+ 
+/* Safe to call at any time (does nothing if no stream is running).
+ * Called by MONITOR STOP, QUIT, and when the session ends for any reason. */
+static void stop_monitor(session_t *s)
+{
+    if (!s->mon_active) return;
+ 
+    pthread_mutex_lock(&s->mon_lock);
+    s->mon_stop = 1;
+    pthread_cond_signal(&s->mon_cond);
+    pthread_mutex_unlock(&s->mon_lock);
+ 
+    pthread_join(s->mon_thread, NULL);
+    close(s->mon_sock);
+    s->mon_active = 0;
+    log_event(s, "MONITOR stopped (UDP port %d)", s->mon_port);
+}
+ 
+static int handle_monitor(session_t *s, char *args)
+{
+    char sub[16] = "", portstr[16] = "", extra[16] = "";
+    int n = sscanf(args, "%15s %15s %15s", sub, portstr, extra);
+ 
+    if (n == 1 && strcmp(sub, "STOP") == 0) {
+        if (!s->mon_active) return send_resp(s, "ERR 013 MONITOR_NOT_RUNNING");
+        stop_monitor(s);
+        return send_resp(s, "OK MONITOR_STOPPED");
+    }
+ 
+    if (n == 2 && strcmp(sub, "START") == 0) {
+        char *end;
+        long port = strtol(portstr, &end, 10);
+        if (*end != '\0' || port < 1 || port > 65535)
+            return send_resp(s, "ERR 009 BAD_ARGUMENTS");
+        if (s->mon_active)
+            return send_resp(s, "ERR 012 MONITOR_ALREADY_RUNNING");
+ 
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) return send_resp(s, "ERR 014 MONITOR_FAILED");
+ 
+        s->mon_sock = sock;
+        s->mon_port = (int)port;
+        s->mon_stop = 0;
+        if (pthread_create(&s->mon_thread, NULL, monitor_thread, s) != 0) {
+            close(sock);
+            return send_resp(s, "ERR 014 MONITOR_FAILED");
+        }
+        s->mon_active = 1;
+        log_event(s, "MONITOR started: UDP to %s:%d every %d s",
+                  s->ip, s->mon_port, MONITOR_INTERVAL_SEC);
+        return send_resp(s, "OK MONITOR_STARTED");
+    }
+ 
+    return send_resp(s, "ERR 009 BAD_ARGUMENTS");
+}
+ 
+/* Per-client thread */
 static void *client_thread(void *arg)
 {
     session_t *s = arg;
     char line[MAX_LINE];
  
     log_event(s, "CONNECT");
+ 
+    /* Per-session lock and condition variable for the UDP monitor thread.
+     * The condition variable uses the monotonic clock so a system clock change
+     * cannot stretch or shrink the monitoring interval. */
+    pthread_condattr_t cattr;
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+    pthread_cond_init(&s->mon_cond, &cattr);
+    pthread_condattr_destroy(&cattr);
+    pthread_mutex_init(&s->mon_lock, NULL);
  
     for (;;) {
         int r = read_line(s, line, sizeof line);
@@ -470,29 +575,34 @@ static void *client_thread(void *arg)
         }
  
         if (strcmp(cmd, "QUIT") == 0) {
+            stop_monitor(s);                /* QUIT also ends the UDP stream */
             send_resp(s, "OK BYE");
             log_event(s, "QUIT");
             break;
         }
  
-        /* Command dispatch (Day 3 adds MONITOR here) */
+        /* Command dispatch */
         int rc;
         if      (strcmp(cmd, "SYSINFO")  == 0) rc = handle_sysinfo(s);
         else if (strcmp(cmd, "LISTPROC") == 0) rc = handle_listproc(s);
         else if (strcmp(cmd, "EXEC")     == 0) rc = handle_exec(s, args);
         else if (strcmp(cmd, "PUT")      == 0) rc = handle_put(s, args);
         else if (strcmp(cmd, "GET")      == 0) rc = handle_get(s, args);
+        else if (strcmp(cmd, "MONITOR")  == 0) rc = handle_monitor(s, args);
         else                                   rc = send_resp(s, "ERR 007 UNKNOWN_COMMAND");
  
         if (rc < 0) { log_event(s, "DISCONNECT (connection lost)"); break; }
     }
  
+    stop_monitor(s);                        /* safety net: any exit path ends the UDP stream */
+    pthread_cond_destroy(&s->mon_cond);
+    pthread_mutex_destroy(&s->mon_lock);
     close(s->fd);
     free(s);
     return NULL;
 }
  
-/* ---------- main: create listening socket, accept loop ---------- */
+/* main: create listening socket, accept loop */
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);               /* a dead client must not kill the Agent */
