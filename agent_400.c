@@ -1,4 +1,3 @@
-
 /* agent_400.c - RemoteOps Agent (server) | Reg No: IT24103400 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -19,14 +18,14 @@
 /* ---- Personalised values (IT24103400) ---- */
 #define REG_NO        "IT24103400"
 #define AGENT_PORT    9410                /* 7000 + 2410 */
-#define SID           "0043"              /* 3400 reversed; kept as a STRING to keep the leading zero */
+#define SID           "0043"              /* 3400 reversed; STRING to keep leading zero */
 #define AUTH_TOKEN    "OPS-3400"
 #define LOG_FILE      "remoteops_IT24103400.log"
 #define STORAGE_ROOT  "./agentfiles"
 #define STORAGE_DIR   "./agentfiles/IT24103400"
  
-#define MAX_LINE 1024
-#define IN_BUF   4096
+#define MAX_LINE      1024
+#define IN_BUF        4096
  
 /* One of these per connected Controller; owned by that client's thread */
 typedef struct {
@@ -99,7 +98,7 @@ static int send_resp(session_t *s, const char *fmt, ...)
 /* ---------- Line reader (framing) ----------
  * Returns: 1 = got a line, 0 = client closed, -1 = recv error, -2 = line too long.
  * Handles: partial lines across recv() calls, and several lines in one recv().
- * Bytes after the newline stay in s->inbuf (essential later for PUT, where
+ * Bytes after the newline stay in s->inbuf (essential for PUT, where
  * raw file bytes follow the command line immediately). */
 static int read_line(session_t *s, char *line, size_t max)
 {
@@ -129,6 +128,113 @@ static int read_line(session_t *s, char *line, size_t max)
         }
         s->inlen += (size_t)n;
     }
+}
+ 
+/* =====================  DAY 2: COMMAND HANDLERS  ===================== */
+/* Every handler returns 0 normally, or -1 if the connection is lost
+ * (the client thread then ends the session). */
+ 
+/* ---------- SYSINFO ---------- */
+/* Fills out with "<cpu_load> <mem_used_mb> <uptime_sec>" read from /proc.
+ * Kept separate so the UDP monitor (Day 3) can reuse it. */
+static void get_sysinfo(char *out, size_t n)
+{
+    double load = 0.0, up = 0.0;
+    long mem_total_kb = 0, mem_avail_kb = 0;
+    FILE *f;
+ 
+    f = fopen("/proc/loadavg", "r");
+    if (f) { if (fscanf(f, "%lf", &load) != 1) load = 0.0; fclose(f); }
+ 
+    f = fopen("/proc/uptime", "r");
+    if (f) { if (fscanf(f, "%lf", &up) != 1) up = 0.0; fclose(f); }
+ 
+    f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[128], key[64];
+        long val;
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "%63[^:]: %ld", key, &val) == 2) {
+                if (strcmp(key, "MemTotal") == 0)          mem_total_kb = val;
+                else if (strcmp(key, "MemAvailable") == 0) mem_avail_kb = val;
+            }
+        }
+        fclose(f);
+    }
+ 
+    snprintf(out, n, "%.2f %ld %ld", load, (mem_total_kb - mem_avail_kb) / 1024, (long)up);
+}
+ 
+static int handle_sysinfo(session_t *s)
+{
+    char info[128];
+    get_sysinfo(info, sizeof info);
+    return send_resp(s, "OK SYSINFO %s", info);
+}
+ 
+/* ---------- LISTPROC ---------- */
+/* Snapshot from "ps", returned as one line: pid:name,pid:name,... */
+static int handle_listproc(session_t *s)
+{
+    FILE *p = popen("ps -eo pid=,comm=", "r");
+    if (!p) return send_resp(s, "ERR 008 COMMAND_FAILED");
+ 
+    char list[3600], line[256];
+    size_t used = 0;
+    list[0] = '\0';
+ 
+    while (fgets(line, sizeof line, p)) {
+        int pid;
+        char name[128];
+        if (sscanf(line, "%d %127s", &pid, name) != 2) continue;
+ 
+        int w = snprintf(list + used, sizeof list - used, "%s%d:%s",
+                         used ? "," : "", pid, name);
+        if (w < 0 || (size_t)w >= sizeof list - used) break;   /* list full: stop here */
+        used += (size_t)w;
+    }
+    list[used] = '\0';          /* drop any half-written entry */
+    pclose(p);
+ 
+    return send_resp(s, "OK PROCS %s", list);
+}
+ 
+/* ---------- EXEC (fixed whitelist) ---------- */
+/* The client's text is only ever compared against this table. It is never
+ * passed to the shell, so nothing outside these five commands can run. */
+static const struct { const char *name; const char *cmd; } exec_table[] = {
+    { "DATE",     "date"      },
+    { "UPTIME",   "uptime"    },
+    { "DISKFREE", "df -h /"   },
+    { "HOSTNAME", "hostname"  },
+    { "WHOAMI",   "whoami"    },
+};
+ 
+static int handle_exec(session_t *s, const char *name)
+{
+    const char *cmd = NULL;
+    for (size_t i = 0; i < sizeof exec_table / sizeof exec_table[0]; i++) {
+        if (strcmp(name, exec_table[i].name) == 0) { cmd = exec_table[i].cmd; break; }
+    }
+    if (!cmd) {
+        log_event(s, "EXEC rejected: '%s' is not whitelisted", name);
+        return send_resp(s, "ERR 002 COMMAND_NOT_ALLOWED");
+    }
+ 
+    FILE *p = popen(cmd, "r");
+    if (!p) return send_resp(s, "ERR 008 COMMAND_FAILED");
+ 
+    char out[1024];
+    size_t n = fread(out, 1, sizeof out - 1, p);
+    out[n] = '\0';
+    pclose(p);
+ 
+    /* The reply must be ONE line, so turn newlines into spaces and trim the end */
+    for (size_t i = 0; i < n; i++)
+        if (out[i] == '\n' || out[i] == '\r') out[i] = ' ';
+    while (n > 0 && out[n - 1] == ' ') out[--n] = '\0';
+ 
+    return send_resp(s, "OK EXEC_RESULT %s", out);
 }
  
 /* ---------- Per-client thread ---------- */
@@ -187,9 +293,14 @@ static void *client_thread(void *arg)
             break;
         }
  
-        /* Day 2/3: SYSINFO, LISTPROC, EXEC, PUT, GET, MONITOR handlers go here */
+        /* Command dispatch (Step 6 adds PUT/GET, Day 3 adds MONITOR) */
+        int rc;
+        if      (strcmp(cmd, "SYSINFO")  == 0) rc = handle_sysinfo(s);
+        else if (strcmp(cmd, "LISTPROC") == 0) rc = handle_listproc(s);
+        else if (strcmp(cmd, "EXEC")     == 0) rc = handle_exec(s, args);
+        else                                   rc = send_resp(s, "ERR 007 UNKNOWN_COMMAND");
  
-        send_resp(s, "ERR 007 UNKNOWN_COMMAND");
+        if (rc < 0) { log_event(s, "DISCONNECT (connection lost)"); break; }
     }
  
     close(s->fd);
@@ -247,4 +358,3 @@ int main(void)
         pthread_detach(t);                  /* no join needed; thread cleans itself up */
     }
 }
- 
