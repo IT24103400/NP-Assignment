@@ -1,3 +1,4 @@
+
 /* agent_400.c - RemoteOps Agent (server) | Reg No: IT24103400 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -5,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <ctype.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <time.h>
@@ -26,6 +28,9 @@
  
 #define MAX_LINE      1024
 #define IN_BUF        4096
+#define XFER_BUF      8192
+#define MAX_FILE_SIZE (50ULL * 1024 * 1024)   /* uploads above 50 MB -> ERR 004 */
+#define MAX_DRAIN     (1ULL << 30)            /* above 1 GB we close instead of draining */
  
 /* One of these per connected Controller; owned by that client's thread */
 typedef struct {
@@ -237,6 +242,183 @@ static int handle_exec(session_t *s, const char *name)
     return send_resp(s, "OK EXEC_RESULT %s", out);
 }
  
+/* ---------- File transfer helpers ---------- */
+/* Allow only [A-Za-z0-9._-], max 100 chars, not starting with '.'.
+ * This blocks path traversal such as "../x" or "/etc/passwd". */
+static int valid_filename(const char *name)
+{
+    size_t len = strlen(name);
+    if (len == 0 || len > 100 || name[0] == '.') return 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (!isalnum(c) && c != '.' && c != '_' && c != '-') return 0;
+    }
+    return 1;
+}
+ 
+/* Read and throw away 'count' bytes, so the byte stream stays in sync
+ * after we reject a PUT whose data is already on its way. */
+static int discard_bytes(session_t *s, unsigned long long count)
+{
+    char buf[XFER_BUF];
+ 
+    size_t take = s->inlen < count ? s->inlen : (size_t)count;   /* leftover first */
+    memmove(s->inbuf, s->inbuf + take, s->inlen - take);
+    s->inlen -= take;
+    count    -= take;
+ 
+    while (count > 0) {
+        size_t want = count < sizeof buf ? (size_t)count : sizeof buf;
+        ssize_t n = recv(s->fd, buf, want, 0);
+        if (n == 0) return -1;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        count -= (unsigned long long)n;
+    }
+    return 0;
+}
+ 
+/* Reject a PUT: swallow its data (if reasonable), then send the error */
+static int reject_put(session_t *s, unsigned long long size, const char *err)
+{
+    if (size > MAX_DRAIN) {                 /* too much to swallow: reply and close */
+        send_resp(s, "%s", err);
+        return -1;
+    }
+    if (discard_bytes(s, size) < 0) return -1;
+    return send_resp(s, "%s", err);
+}
+ 
+/* ---------- PUT <filename> <filesize> + raw bytes ---------- */
+static int handle_put(session_t *s, char *args)
+{
+    char *sp = strrchr(args, ' ');
+    if (!sp) return send_resp(s, "ERR 009 BAD_ARGUMENTS");
+    *sp = '\0';
+    char *name = args;
+    char *sz   = sp + 1;
+ 
+    size_t nl = strlen(name);
+    while (nl > 0 && name[nl - 1] == ' ') name[--nl] = '\0';
+ 
+    if (*sz < '0' || *sz > '9') return send_resp(s, "ERR 009 BAD_ARGUMENTS");
+    char *end;
+    errno = 0;
+    unsigned long long size = strtoull(sz, &end, 10);
+    if (*end != '\0' || errno == ERANGE) return send_resp(s, "ERR 009 BAD_ARGUMENTS");
+ 
+    if (size > MAX_FILE_SIZE) {
+        log_event(s, "PUT rejected: %s is %llu bytes (limit %llu)", name, size, MAX_FILE_SIZE);
+        return reject_put(s, size, "ERR 004 FILE_TOO_LARGE");
+    }
+    if (!valid_filename(name)) {
+        log_event(s, "PUT rejected: bad filename '%s'", name);
+        return reject_put(s, size, "ERR 010 BAD_FILENAME");
+    }
+ 
+    /* Write into a temporary file, then rename() it into place when complete.
+     * Other clients never see a half-written file, and two clients uploading
+     * the same name at once cannot corrupt each other (last rename wins). */
+    char path[256], tmp[256];
+    snprintf(path, sizeof path, "%s/%s", STORAGE_DIR, name);
+    snprintf(tmp,  sizeof tmp,  "%s/.part.%d", STORAGE_DIR, s->fd);
+ 
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        log_event(s, "PUT %s failed: cannot create file (%s)", name, strerror(errno));
+        return reject_put(s, size, "ERR 011 STORAGE_ERROR");
+    }
+ 
+    log_event(s, "PUT %s start (%llu bytes)", name, size);
+ 
+    unsigned long long remaining = size;
+    int write_err = 0;
+    char buf[XFER_BUF];
+ 
+    /* Step 1: bytes that already arrived together with the command line */
+    size_t take = s->inlen < remaining ? s->inlen : (size_t)remaining;
+    if (take > 0) {
+        if (fwrite(s->inbuf, 1, take, f) != take) write_err = 1;
+        memmove(s->inbuf, s->inbuf + take, s->inlen - take);
+        s->inlen  -= take;
+        remaining -= take;
+    }
+ 
+    /* Step 2: the rest comes from the socket, in however many recv() calls it takes */
+    while (remaining > 0) {
+        size_t want = remaining < sizeof buf ? (size_t)remaining : sizeof buf;
+        ssize_t n = recv(s->fd, buf, want, 0);
+        if (n == 0 || (n < 0 && errno != EINTR)) {
+            fclose(f);
+            remove(tmp);                    /* never keep a partial upload */
+            log_event(s, "PUT %s aborted: connection lost with %llu bytes missing",
+                      name, remaining);
+            return -1;
+        }
+        if (n < 0) continue;                /* EINTR */
+        if (!write_err && fwrite(buf, 1, (size_t)n, f) != (size_t)n) write_err = 1;
+        remaining -= (unsigned long long)n;
+    }
+ 
+    if (fclose(f) != 0) write_err = 1;
+    if (write_err || rename(tmp, path) != 0) {
+        remove(tmp);
+        log_event(s, "PUT %s failed: could not store file", name);
+        return send_resp(s, "ERR 011 STORAGE_ERROR");
+    }
+ 
+    log_event(s, "PUT %s complete (%llu bytes stored)", name, size);
+    return send_resp(s, "OK FILE_RECEIVED %s", name);
+}
+ 
+/* ---------- GET <filename> ---------- */
+static int handle_get(session_t *s, char *args)
+{
+    char *name = args;
+    size_t nl = strlen(name);
+    while (nl > 0 && name[nl - 1] == ' ') name[--nl] = '\0';
+ 
+    if (!valid_filename(name)) {
+        log_event(s, "GET rejected: bad filename '%s'", name);
+        return send_resp(s, "ERR 010 BAD_FILENAME");
+    }
+ 
+    char path[256];
+    snprintf(path, sizeof path, "%s/%s", STORAGE_DIR, name);
+ 
+    struct stat st;
+    FILE *f = fopen(path, "rb");
+    if (!f || fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (f) fclose(f);
+        log_event(s, "GET %s failed: file not found", name);
+        return send_resp(s, "ERR 005 FILE_NOT_FOUND");
+    }
+ 
+    unsigned long long size = (unsigned long long)st.st_size;
+    if (send_resp(s, "OK FILE_SEND %s %llu", name, size) < 0) { fclose(f); return -1; }
+ 
+    log_event(s, "GET %s start (%llu bytes)", name, size);
+ 
+    char buf[XFER_BUF];
+    unsigned long long sent = 0;
+    while (sent < size) {
+        size_t want = size - sent < sizeof buf ? (size_t)(size - sent) : sizeof buf;
+        size_t n = fread(buf, 1, want, f);
+        if (n == 0 || send_all(s->fd, buf, n) < 0) {
+            fclose(f);
+            log_event(s, "GET %s aborted after %llu of %llu bytes", name, sent, size);
+            return -1;                      /* we promised <size> bytes; close the session */
+        }
+        sent += n;
+    }
+    fclose(f);
+ 
+    log_event(s, "GET %s complete (%llu bytes sent)", name, size);
+    return 0;
+}
+ 
 /* ---------- Per-client thread ---------- */
 static void *client_thread(void *arg)
 {
@@ -293,11 +475,13 @@ static void *client_thread(void *arg)
             break;
         }
  
-        /* Command dispatch (Step 6 adds PUT/GET, Day 3 adds MONITOR) */
+        /* Command dispatch (Day 3 adds MONITOR here) */
         int rc;
         if      (strcmp(cmd, "SYSINFO")  == 0) rc = handle_sysinfo(s);
         else if (strcmp(cmd, "LISTPROC") == 0) rc = handle_listproc(s);
         else if (strcmp(cmd, "EXEC")     == 0) rc = handle_exec(s, args);
+        else if (strcmp(cmd, "PUT")      == 0) rc = handle_put(s, args);
+        else if (strcmp(cmd, "GET")      == 0) rc = handle_get(s, args);
         else                                   rc = send_resp(s, "ERR 007 UNKNOWN_COMMAND");
  
         if (rc < 0) { log_event(s, "DISCONNECT (connection lost)"); break; }
@@ -358,3 +542,4 @@ int main(void)
         pthread_detach(t);                  /* no join needed; thread cleans itself up */
     }
 }
+ 
