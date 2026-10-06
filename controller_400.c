@@ -1,5 +1,4 @@
 
-
 /* controller_400.c - RemoteOps Controller (client) | Reg No: IT24103400 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -9,6 +8,8 @@
 #include <errno.h>
 #include <signal.h>
 #include <libgen.h>
+#include <pthread.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -78,9 +79,9 @@ static void rtrim(char *s)
     while (n > 0 && s[n - 1] == ' ') s[--n] = '\0';
 }
  
-/* Plain one-line command: send, read one reply line 
+/*  Plain one-line command: send, read one reply line 
  * Returns 0 = continue, 1 = Agent said BYE, -1 = connection lost */
-static int do_simple(conn_t *c, const char *input)
+static int do_simple(conn_t *c, const char *input, char *first_out)
 {
     char out[MAX_LINE + 2], resp[IN_BUF];
     int n = snprintf(out, sizeof out, "%s\n", input);
@@ -91,6 +92,7 @@ static int do_simple(conn_t *c, const char *input)
  
     int r = read_line(c, resp, sizeof resp);
     if (r <= 0) { printf("Connection closed by Agent\n"); return -1; }
+    if (first_out) snprintf(first_out, 64, "%.63s", resp);   /* caller may inspect the reply */
     printf("%s\n", resp);
  
     return strncmp(resp, "OK BYE", 6) == 0 ? 1 : 0;
@@ -168,7 +170,7 @@ static int recv_file(conn_t *c, FILE *f, unsigned long long size)
     return 0;
 }
  
-/* GET <filename>
+/* GET <filename> 
  * Reply line "OK FILE_SEND <name> <size>" is followed by exactly <size> raw bytes.
  * Saved to ./downloads/<name> so the original file is never overwritten. */
 static int do_get(conn_t *c, char *name)
@@ -210,6 +212,97 @@ static int do_get(conn_t *c, char *name)
     return 0;
 }
  
+/* UDP monitoring receiver 
+ * MONITOR START <udp_port>: bind a UDP socket on that port, then ask the Agent to
+ * send datagrams to it. A background thread prints each datagram as it arrives
+ * while the prompt stays usable. MONITOR STOP / QUIT / exit stops the thread. */
+static int           udp_fd = -1;
+static pthread_t     udp_thread;
+static volatile int  udp_running = 0;
+ 
+static void *udp_receiver(void *arg)
+{
+    (void)arg;
+    char buf[512];
+    while (udp_running) {
+        ssize_t n = recvfrom(udp_fd, buf, sizeof buf - 1, 0, NULL, NULL);
+        if (n < 0) continue;            /* 500 ms timeout or EINTR: re-check udp_running */
+        buf[n] = '\0';
+        printf("\r\033[K[UDP] %s\nremoteops> ", buf);
+        fflush(stdout);
+    }
+    return NULL;
+}
+ 
+/* Returns 0 on success, -1 on failure, -2 if already receiving */
+static int start_udp(int port)
+{
+    if (udp_running) return -2;
+ 
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { perror("udp socket"); return -1; }
+ 
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port        = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) {
+        printf("Cannot listen on UDP port %d: %s\n", port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+ 
+    struct timeval tv = { 0, 500000 };  /* recvfrom wakes every 0.5 s so we can stop cleanly */
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+ 
+    udp_fd = fd;
+    udp_running = 1;
+    if (pthread_create(&udp_thread, NULL, udp_receiver, NULL) != 0) {
+        udp_running = 0;
+        close(fd);
+        udp_fd = -1;
+        return -1;
+    }
+    return 0;
+}
+ 
+static void stop_udp(void)
+{
+    if (!udp_running) return;
+    udp_running = 0;
+    pthread_join(udp_thread, NULL);
+    close(udp_fd);
+    udp_fd = -1;
+}
+ 
+/* MONITOR START <port> | MONITOR STOP: manage the local UDP receiver around the TCP command */
+static int do_monitor(conn_t *c, const char *input)
+{
+    char sub[16] = "", portstr[16] = "";
+    int n = sscanf(input, "MONITOR %15s %15s", sub, portstr);
+    int started_here = 0;
+ 
+    if (n >= 2 && strcmp(sub, "START") == 0) {
+        int port = atoi(portstr);
+        if (port >= 1 && port <= 65535) {       /* bad ports are left for the Agent to reject */
+            int r = start_udp(port);
+            if (r == -2) { printf("Already receiving monitoring data; send MONITOR STOP first\n"); return 0; }
+            if (r < 0) return 0;
+            started_here = 1;
+        }
+    }
+ 
+    char first[64] = "";
+    int rc = do_simple(c, input, first);
+ 
+    if (started_here && strncmp(first, "OK MONITOR_STARTED", 18) != 0)
+        stop_udp();                             /* the Agent refused: no stream is coming */
+    if (n >= 1 && strcmp(sub, "STOP") == 0 && strncmp(first, "OK MONITOR_STOPPED", 18) == 0)
+        stop_udp();
+    return rc;
+}
+ 
 int main(int argc, char *argv[])
 {
     const char *host = (argc > 1) ? argv[1] : "127.0.0.1";
@@ -234,25 +327,27 @@ int main(int argc, char *argv[])
         return 1;
     }
     printf("Connected to %s:%d\n", host, port);
-    printf("Commands: AUTH <token>, SYSINFO, LISTPROC, EXEC <name>, PUT <file>, GET <file>, QUIT\n");
+    printf("Commands: AUTH <token>, SYSINFO, LISTPROC, EXEC <name>, PUT <file>, GET <file>,\n          MONITOR START <udp_port>, MONITOR STOP, QUIT\n");
  
     char input[MAX_LINE];
  
     for (;;) {
         printf("remoteops> ");
         fflush(stdout);
-        if (!fgets(input, sizeof input, stdin)) break;      /* Ctrl+D */
+        if (!fgets(input, sizeof input, stdin)) break;      
         input[strcspn(input, "\r\n")] = '\0';
         if (input[0] == '\0') continue;
  
         int rc;
         if      (strncmp(input, "PUT ", 4) == 0) rc = do_put(&c, input + 4);
         else if (strncmp(input, "GET ", 4) == 0) rc = do_get(&c, input + 4);
-        else                                     rc = do_simple(&c, input);
+        else if (strncmp(input, "MONITOR ", 8) == 0) rc = do_monitor(&c, input);
+        else                                     rc = do_simple(&c, input, NULL);
  
         if (rc != 0) break;                     /* 1 = BYE, -1 = connection lost */
     }
  
+    stop_udp();
     close(c.fd);
     return 0;
 }
